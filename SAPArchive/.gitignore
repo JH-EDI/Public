@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.vscode/settings.json
+out/
+.env
+
+# Ignore generated or bulky metadata and parquet files
+metadata/
+parquet/
+
+# Keep helper scripts ignored
+scripts/setup_env.ps1
