@@ -103,7 +103,19 @@ def _access_check(conn_str: str, schema: str, name: str) -> bool:
 
 
 def _hana_cast_type(col_meta: Dict[str, Any]) -> str:
-    dt = (col_meta.get("DATA_TYPE") or "").upper()
+    # The catalog stores whatever field we were able to fetch from the
+    # metadata query.  Historically we shoved the value into the `DATA_TYPE`
+    # key, but HANA actually returns its type in a column called
+    # SQL_TYPE_NAME (some versions also expose DATA_TYPE_NAME, TYPE_NAME, etc).
+    # Make sure we look at all of them so casting works regardless of which one
+    # was present.
+    dt = (
+        col_meta.get("SQL_TYPE_NAME")
+        or col_meta.get("DATA_TYPE")
+        or col_meta.get("DATA_TYPE_NAME")
+        or col_meta.get("TYPE_NAME")
+        or ""
+    ).upper()
     prec = col_meta.get("NUMERIC_PRECISION")
     scale = col_meta.get("NUMERIC_SCALE")
     char_len = col_meta.get("CHARACTER_MAXIMUM_LENGTH")
@@ -138,7 +150,13 @@ def _hana_cast_type(col_meta: Dict[str, Any]) -> str:
     if "CHAR" in dt:
         length = int(char_len) if char_len else 1
         return f"CHAR({length})"
-    return "NVARCHAR(5000)"
+    # fallback when we couldn't determine a specific type from the
+    # catalog metadata.  HANA supports up to NVARCHAR(5000), but using a
+    # plain VARCHAR(8000) here gives a little more breathing room and
+    # avoids the very common NVARCHAR(5000) cast that was previously
+    # emitted for every unknown column.  Parquet will simply treat this
+    # as a UTF8 string/large_string anyway.
+    return "VARCHAR(8000)"
 
 
 def _build_select_template(schema: str, name: str, cols: List[Dict[str, Any]]) -> str:
@@ -246,20 +264,38 @@ def _list_views(conn: pyodbc.Connection, schema: str) -> List[str]:
         return []
 
 
-def _get_table_columns(conn: pyodbc.Connection, schema: str, table: str) -> List[Dict[str, Any]]:
+def _get_table_columns(
+    conn: pyodbc.Connection, schema: str, table: str, *, verbose: bool = False
+) -> List[Dict[str, Any]]:
     cur = conn.cursor()
-    cur.execute('SELECT * FROM "SYS"."TABLE_COLUMNS" WHERE SCHEMA_NAME = ? AND TABLE_NAME = ? ORDER BY POSITION', (schema, table))
+    cur.execute(
+        'SELECT * FROM "SYS"."TABLE_COLUMNS" WHERE SCHEMA_NAME = ? AND TABLE_NAME = ? ORDER BY POSITION',
+        (schema, table),
+    )
     cols = [c[0] for c in cur.description]
+    if verbose:
+        print(f"      SYS.TABLE_COLUMNS columns: {cols}")
     out: List[Dict[str, Any]] = []
     for r in cur.fetchall():
         row = dict(zip(cols, r))
+        if verbose and not out:
+            # print the first row so we can see what the type column is called
+            print(f"      sample row metadata: {row}")
         mapped = {
             "COLUMN_NAME": row.get("COLUMN_NAME") or row.get("COLUMN") or row.get("FIELD_NAME"),
-            "DATA_TYPE": row.get("SQL_TYPE_NAME") or row.get("DATA_TYPE") or row.get("TYPE_NAME"),
+            # capture whichever field actually holds the type; prefer SQL_TYPE_NAME
+            "DATA_TYPE": (
+                row.get("SQL_TYPE_NAME")
+                or row.get("DATA_TYPE")
+                or row.get("DATA_TYPE_NAME")
+                or row.get("TYPE_NAME")
+            ),
             "CHARACTER_MAXIMUM_LENGTH": row.get("LENGTH"),
             "NUMERIC_PRECISION": row.get("PRECISION"),
             "NUMERIC_SCALE": row.get("SCALE"),
-            "IS_NULLABLE": row.get("IS_NULLABLE") if row.get("IS_NULLABLE") is not None else ("YES" if row.get("NULLABLE") else "NO"),
+            "IS_NULLABLE": row.get("IS_NULLABLE")
+            if row.get("IS_NULLABLE") is not None
+            else ("YES" if row.get("NULLABLE") else "NO"),
             "ORDINAL_POSITION": row.get("POSITION"),
         }
         out.append(mapped)
@@ -282,18 +318,31 @@ def dump_hana_catalog(
     """Dump HANA catalog to a JSON file and return the catalog dict.
 
     - Defaults to schema `SAPBI` and writes to `metadata/hana_catalog.json`.
+    - Tables that report zero rows are omitted entirely; only objects with
+      at least one row are kept (views are always included since we cannot
+      determine their row count cheaply).
     - When `verbose=True` the function prints progress messages so the
       caller (CLI or scripts) can show activity while the catalog is built.
     """
     if verbose:
         print("Connecting to HANA...")
-    f = HanaFetcher(dev_mode=False)
+    f = HanaFetcher()
     conn_str = _build_conn_str(f)
     conn = pyodbc.connect(conn_str, timeout=10)
     worker_count = max(2, min(max_workers, 4))
     queries_dir = os.path.abspath(queries_output_dir)
     if generate_queries:
-        os.makedirs(queries_dir, exist_ok=True)
+        # start with a clean slate so leftover SQL files from previous runs
+        # (especially those for zero‑row tables) are removed.
+        if os.path.isdir(queries_dir):
+            for fname in os.listdir(queries_dir):
+                path = os.path.join(queries_dir, fname)
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+        else:
+            os.makedirs(queries_dir, exist_ok=True)
 
     try:
         if all_schemas:
@@ -336,17 +385,22 @@ def dump_hana_catalog(
                         count = fut.result()
                         if count is not None:
                             table_counts[tbl] = count
-                            accessible_tables.append(tbl)
+                            # only include tables with at least one row
+                            if count > 0:
+                                accessible_tables.append(tbl)
                 if verbose:
-                    print(f"  accessible tables: {len(accessible_tables)}/{len(tables)}")
+                    print(f"  accessible tables with rows: {len(accessible_tables)}/{len(tables)}")
             else:
+                # when not counting we don't know which tables have rows, so include
+                # them all; caller may later filter or regenerated catalog should
+                # run with count_tables=True for the desired behaviour.
                 accessible_tables = list(tables)
 
             for i, tbl in enumerate(accessible_tables, start=1):
                 if verbose and (i % 10 == 0 or i == 1):
                     print(f"    processing table {i}/{len(accessible_tables)}: {tbl}")
                 try:
-                    cols = _get_table_columns(conn, schema, tbl)
+                    cols = _get_table_columns(conn, schema, tbl, verbose=verbose)
                 except Exception:
                     cols = []
                 entry: Dict[str, Any] = {
@@ -402,7 +456,7 @@ def dump_hana_catalog(
                     if verbose:
                         print(f"    processing view: {vw}")
                     try:
-                        cols = _get_table_columns(conn, schema, vw)
+                        cols = _get_table_columns(conn, schema, vw, verbose=verbose)
                     except Exception:
                         cols = []
                     entry: Dict[str, Any] = {

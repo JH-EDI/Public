@@ -1,7 +1,7 @@
 """Command-line interface for sap-archive.
 
-This CLI intentionally contains safe defaults and a development-mode data generator
-so you can run and test without a live HANA instance.
+This CLI provides commands to run SQL files from `./queries/` and export
+results to Parquet using a real HANA connection.
 """
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ def export(query: str | None) -> None:
     """Run SQL file(s) in `./queries/` and write Parquet outputs to `./parquet/`.
 
     - Only `--query` is accepted (optional). Output path is `parquet/<query>.parquet`.
-    - Dev mode is auto-detected when `SAP_HANA_DSN` is not set.
+    - Requires `SAP_HANA_DSN` to be set in the environment.
     """
     out = Path("parquet")
     out.mkdir(parents=True, exist_ok=True)
@@ -41,9 +41,11 @@ def export(query: str | None) -> None:
     runtime_dsn = os.getenv("SAP_HANA_DSN")
     runtime_user = os.getenv("SAP_HANA_USER")
     runtime_password = os.getenv("SAP_HANA_PASSWORD")
-    dev_mode = not bool(runtime_dsn)
+    if not runtime_dsn:
+        click.echo("ERROR: SAP_HANA_DSN is not set — set HANA connection via SAP_HANA_DSN env var.", err=True)
+        raise SystemExit(2)
 
-    fetcher = HanaFetcher(dsn=runtime_dsn, user=runtime_user, password=runtime_password, dev_mode=dev_mode)
+    fetcher = HanaFetcher(dsn=runtime_dsn, user=runtime_user, password=runtime_password)
 
     queries_dir = Path.cwd() / "queries"
     if query:
@@ -123,7 +125,7 @@ def version_cmd() -> None:
 
         click.echo(version("sap-archive"))
     except Exception:
-        click.echo("(development)")
+        click.echo("(unknown version)")
 
 
 def main(argv: Optional[list[str]] = None) -> int:

@@ -1,7 +1,7 @@
 """HANA data fetch utilities.
 
 - Provides a small abstraction that uses a real HANA client when available
-  (hdbcli) and a deterministic dev-mode generator for local testing.
+    (hdbcli) to execute queries and stream results to pandas.
 - Users must supply credentials via env vars or CLI options.
 
 Note: the real `hdbcli` package is optional and is listed as an extra (`[hana]`).
@@ -14,31 +14,26 @@ from pathlib import Path
 
 import pandas as pd
 
-DEV_ROW_COUNT = 12_345
-
-
 class HanaFetcher:
-    def __init__(self, dsn: Optional[str] = None, user: Optional[str] = None, password: Optional[str] = None, dev_mode: bool = False) -> None:
+    def __init__(self, dsn: Optional[str] = None, user: Optional[str] = None, password: Optional[str] = None) -> None:
         self.dsn = dsn or os.getenv("SAP_HANA_DSN")
         self.user = user or os.getenv("SAP_HANA_USER")
         self.password = password or os.getenv("SAP_HANA_PASSWORD")
-        self.dev_mode = dev_mode
 
         # Prefer pyodbc (ODBC) as the runtime connector
         self._has_pyodbc = False
         self._pyodbc = None
-        if not dev_mode:
-            try:
-                import pyodbc as _pyodbc
+        try:
+            import pyodbc as _pyodbc
 
-                self._pyodbc = _pyodbc
-                self._has_pyodbc = True
-            except Exception:
-                self._has_pyodbc = False
+            self._pyodbc = _pyodbc
+            self._has_pyodbc = True
+        except Exception:
+            self._has_pyodbc = False
 
     def _raise_no_client(self) -> None:
         raise RuntimeError(
-            "No supported Python HANA client found in the environment. Install 'pyodbc' (recommended) or the SAP 'hdbcli' package, or run with --dev."
+            "No supported Python HANA client found in the environment. Install 'pyodbc' (recommended) or the SAP 'hdbcli' package."
         )
 
     def fetch_in_chunks(
@@ -52,15 +47,13 @@ class HanaFetcher:
         Parameters
         - sql: SQL text to execute.
         - chunk_size: number of rows per chunk.
-        - params: optional parameter binding. In dev-mode a mapping like
-          `{"WM1": <value>}` is understood and will be applied as a
-          watermark filter. In production a sequence of parameters is
-          forwarded to the DB driver's execute call.
+        - params: optional parameter binding. A sequence of parameters is
+          forwarded to the DB driver's execute call; named mappings are not
+          used by this layer (placeholder substitution occurs at the query
+          level).
         """
-        if self.dev_mode:
-            # dev generator can honor simple params (watermarks)
-            yield from _dev_generator(chunk_size, params=params)
-            return
+        # Production path: require a DB client
+        # (no local fake-data generator)
 
         if not getattr(self, "_has_pyodbc", False) or self._pyodbc is None:
             self._raise_no_client()
@@ -138,42 +131,3 @@ class HanaFetcher:
                 from .parquet import dataframe_to_parquet
 
                 dataframe_to_parquet(df, target, compression=parquet_kwargs.get("compression", "snappy"))
-
-def _dev_generator(chunk_size: int = 1000, params: Optional[object] = None) -> Generator[pd.DataFrame, None, None]:
-    """Deterministic fake data for local dev/testing.
-
-    Supports a simple `params` mapping for watermark simulation: if
-    `params` contains `WM1` (numeric), the generator yields only rows with
-    `id > WM1`.
-    """
-    import numpy as np
-
-    # support `params` being a mapping or other truthy object
-    wm_threshold = None
-    if isinstance(params, dict) and "WM1" in params:
-        try:
-            wm_threshold = int(params["WM1"])
-        except Exception:
-            wm_threshold = None
-
-    n = DEV_ROW_COUNT
-    # start index (0-based) — if wm_threshold given, skip up to that id
-    idx = 0 if wm_threshold is None else min(max(0, wm_threshold), n)
-    while idx < n:
-        take = min(chunk_size, n - idx)
-        # ids are 1-based
-        start_id = idx + 1
-        df: pd.DataFrame = pd.DataFrame({
-            "id": range(start_id, start_id + take),
-            "value": (np.arange(take) + idx) % 100,
-            "text": [f"row-{i}" for i in range(start_id, start_id + take)],
-        })
-        # if wm_threshold is set, filter rows with id > wm_threshold
-        if wm_threshold is not None:
-            df = df[df["id"] > wm_threshold]
-            # if entire chunk filtered out, advance and continue
-            if df.empty:
-                idx += take
-                continue
-        yield df
-        idx += take
