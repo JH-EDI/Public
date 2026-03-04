@@ -268,19 +268,30 @@ def _get_table_columns(
     conn: pyodbc.Connection, schema: str, table: str, *, verbose: bool = False
 ) -> List[Dict[str, Any]]:
     cur = conn.cursor()
+    # Try table columns first (covers base tables and some variants).
     cur.execute(
         'SELECT * FROM "SYS"."TABLE_COLUMNS" WHERE SCHEMA_NAME = ? AND TABLE_NAME = ? ORDER BY POSITION',
         (schema, table),
     )
-    cols = [c[0] for c in cur.description]
-    if verbose:
-        print(f"      SYS.TABLE_COLUMNS columns: {cols}")
+    rows = cur.fetchall()
+    cols = [c[0] for c in cur.description] if cur.description is not None else []
+
+    # If no rows found in TABLE_COLUMNS, the object may be a view; try VIEW_COLUMNS.
+    if not rows:
+        try:
+            cur.execute(
+                'SELECT * FROM "SYS"."VIEW_COLUMNS" WHERE SCHEMA_NAME = ? AND VIEW_NAME = ? ORDER BY POSITION',
+                (schema, table),
+            )
+            rows = cur.fetchall()
+            cols = [c[0] for c in cur.description] if cur.description is not None else []
+        except Exception:
+            # Fall through with empty rows/cols
+            rows = []
+
     out: List[Dict[str, Any]] = []
-    for r in cur.fetchall():
+    for r in rows:
         row = dict(zip(cols, r))
-        if verbose and not out:
-            # print the first row so we can see what the type column is called
-            print(f"      sample row metadata: {row}")
         mapped = {
             "COLUMN_NAME": row.get("COLUMN_NAME") or row.get("COLUMN") or row.get("FIELD_NAME"),
             # capture whichever field actually holds the type; prefer SQL_TYPE_NAME
