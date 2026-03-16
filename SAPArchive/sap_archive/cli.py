@@ -76,6 +76,55 @@ def export(query: str | None) -> None:
         raise SystemExit(3)
 
 
+@cli.command("mirror")
+@click.option("--table", "table_name", help="Run Open Mirror processing for a specific table (folder under queries/)")
+@click.option("--out", "out_dir", default="parquet", help="Output root folder for mirror files")
+def mirror(table_name: str | None, out_dir: str) -> None:
+    """Run Open Mirror export for tables defined under `queries/<table>/`.
+
+    Each table folder should contain:
+      - `state.json` (tracking watermark/sequence)
+      - `delta.sql` and/or `full.sql`
+    """
+    runtime_dsn = os.getenv("SAP_HANA_DSN")
+    runtime_user = os.getenv("SAP_HANA_USER")
+    runtime_password = os.getenv("SAP_HANA_PASSWORD")
+    if not runtime_dsn:
+        click.echo("ERROR: SAP_HANA_DSN is not set — set HANA connection via SAP_HANA_DSN env var.", err=True)
+        raise SystemExit(2)
+
+    fetcher = HanaFetcher(dsn=runtime_dsn, user=runtime_user, password=runtime_password)
+
+    queries_dir = Path.cwd() / "queries"
+    if not queries_dir.exists():
+        click.echo("No 'queries/' folder found; create a table folder under queries/ and re-run.", err=True)
+        raise SystemExit(2)
+
+    out_root = Path(out_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    from .queries import run_open_mirror
+
+    if table_name:
+        folder = queries_dir / table_name
+        if not folder.exists() or not folder.is_dir():
+            click.echo(f"Query table folder '{table_name}' not found under queries/", err=True)
+            raise SystemExit(2)
+        results = run_open_mirror(folder, fetcher, out_root)
+    else:
+        results = run_open_mirror(queries_dir, fetcher, out_root)
+
+    any_failed = any(not r.succeeded() for r in results)
+    for r in results:
+        if r.succeeded():
+            click.echo(f"{r.name}: OK — {r.rows if r.rows is not None else 'unknown'} rows written ({r.elapsed:.2f}s)")
+        else:
+            click.echo(f"{r.name}: ERROR — {r.error}", err=True)
+
+    if any_failed:
+        raise SystemExit(3)
+
+
 @cli.command("catalog")
 def catalog_cmd() -> None:
     """Generate HANA catalog and write to `metadata/hana_catalog.json`.

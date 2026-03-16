@@ -98,6 +98,26 @@ def compute_max_wm_tuple(path: Path | str, wm_cols: list[str]) -> tuple | None:
     return max(tuples)
 
 
+def compute_max_column(path: Path | str, col: str):
+    """Return the max value in a single column from a Parquet file.
+
+    Returns None if the file/column is missing or the file is empty.
+    """
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        import pandas as pd
+
+        df = pd.read_parquet(p, columns=[col])
+    except Exception:
+        return None
+    if df.empty or col not in df.columns:
+        return None
+    # Use pandas max (works for numeric, datetime, strings)
+    return df[col].max()
+
+
 
 def dataframes_to_single_parquet(
     df_iter: Iterable[Optional[pd.DataFrame]],

@@ -283,3 +283,181 @@ def run_queries_folder(folder: Path, fetcher: HanaFetcher, out_dir: Path, chunk_
             results.append(res)
 
     return results
+
+
+def iter_open_mirror_tables(folder: Path) -> Iterator[Path]:
+    """Yield subfolders in `folder` that are candidates for Open Mirror exports."""
+    folder = Path(folder)
+    if not folder.exists():
+        return
+    for p in sorted(folder.iterdir()):
+        if p.is_dir():
+            yield p
+
+
+def _load_state(path: Path) -> dict:
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _save_state(path: Path, state: dict) -> None:
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _choose_query_file(folder: Path) -> Path | None:
+    """Pick the query file to run in an Open Mirror folder."""
+    # Prefer explicit names for clarity.
+    for name in ("delta.sql", "full.sql", "query.sql"):
+        p = folder / name
+        if p.exists():
+            return p
+    # fallback: first .sql file found
+    for p in sorted(folder.iterdir()):
+        if p.is_file() and p.suffix.lower() == ".sql":
+            return p
+    return None
+
+
+def run_open_mirror(
+    queries_root: Path,
+    fetcher: HanaFetcher,
+    out_root: Path,
+    *,
+    chunk_size: int = 50_000,
+    sequence_digits: int = 10,
+) -> List[QueryResult]:
+    """Run Open Mirror exports for a set of table folders.
+
+    `queries_root` can be either:
+      - a folder containing multiple table folders (each with its own state.json),
+      - or a single table folder itself.
+
+    Each table folder is required to contain:
+      - `state.json` (tracking last watermark/sequence)
+      - one or more `.sql` files (e.g. `delta.sql`, `full.sql`)
+
+    Output is written under `out_root/<table>/` as sequential Parquet files
+    (`0000000001.parquet`, …).
+    """
+
+    results: List[QueryResult] = []
+
+    # Determine which folders to process.
+    if (queries_root / "state.json").exists():
+        folders = [queries_root]
+    else:
+        folders = list(iter_open_mirror_tables(queries_root))
+
+    for folder in folders:
+        name = folder.name
+        res = QueryResult(name=name)
+        start = time.perf_counter()
+
+        state_path = folder / "state.json"
+        state = _load_state(state_path)
+        seq = int(state.get("last_sequence", 0))
+        last_watermark = state.get("last_watermark")
+        watermark_col = state.get("watermark_column")
+        watermark_table = state.get("watermark_table")
+
+        # Choose which query to run based on state and available files.
+        # If this is the first run (seq == 0) and a full-refresh query exists,
+        # run full.sql first. Otherwise, run delta.sql.
+        full_query = folder / "full.sql"
+        delta_query = folder / "delta.sql"
+
+        if seq == 0 and full_query.exists():
+            query_file = full_query
+        elif delta_query.exists():
+            query_file = delta_query
+        else:
+            query_file = _choose_query_file(folder)
+
+        if query_file is None:
+            res.error = "no SQL file found in folder"
+            results.append(res)
+            continue
+
+        try:
+            sql = read_sql(query_file)
+            # substitute watermark placeholder for delta queries only
+            if query_file.name == "delta.sql" and "{WATERMARK}" in sql:
+                wm = last_watermark if last_watermark is not None else 0
+                sql = sql.replace("{WATERMARK}", str(wm))
+
+            out_table_dir = out_root / name
+            out_table_dir.mkdir(parents=True, exist_ok=True)
+            seq += 1
+            out_path = out_table_dir / f"{seq:0{sequence_digits}d}.parquet"
+
+            # run the query and write a single parquet file
+            gen = fetcher.fetch_in_chunks(sql, chunk_size=chunk_size)
+            dataframes_to_single_parquet(gen, out_path, compression="snappy", row_group_size=chunk_size)
+
+            # compute row count
+            res.rows = -1
+            try:
+                import pyarrow.parquet as pq
+
+                pf = pq.ParquetFile(str(out_path))
+                res.rows = pf.metadata.num_rows
+            except Exception:
+                res.rows = -1
+
+            # If the query returned no rows, remove the empty file and do not
+            # advance the sequence (no new snapshot to deliver).
+            if res.rows == 0:
+                try:
+                    out_path.unlink()
+                except Exception:
+                    pass
+                seq -= 1
+                res.rows = 0
+
+            # compute new watermark from the source delta table (not from the parquet)
+            new_watermark = None
+            if watermark_table and watermark_col:
+                try:
+                    schema, tbl = watermark_table.split(".", 1)
+                    watermark_sql = (
+                        f"SELECT MAX(\"{watermark_col}\") AS wm "
+                        f"FROM \"{schema}\".\"{tbl}\" "
+                        f"WHERE \"{watermark_col}\" > {last_watermark}"
+                    )
+                    # Use a small chunk size and expect one row
+                    wal_df = next(fetcher.fetch_in_chunks(watermark_sql, chunk_size=1), None)
+                    if wal_df is not None and not wal_df.empty:
+                        # Parquet/pandas can uppercase column names; handle both.
+                        col = next((c for c in wal_df.columns if c.lower() == "wm"), None)
+                        if col is not None:
+                            new_watermark = wal_df.iloc[0][col]
+                except Exception:
+                    new_watermark = None
+
+            # Update state and persist
+            state["last_run_utc"] = datetime.utcnow().isoformat() + "Z"
+            state["last_sequence"] = seq
+            if new_watermark is not None:
+                try:
+                    state["last_watermark"] = int(new_watermark)
+                except Exception:
+                    state["last_watermark"] = new_watermark
+            if watermark_col:
+                state["watermark_column"] = watermark_col
+            if watermark_table:
+                state["watermark_table"] = watermark_table
+
+            _save_state(state_path, state)
+
+
+        except Exception as exc:
+            res.error = str(exc)
+        finally:
+            res.elapsed = time.perf_counter() - start
+            results.append(res)
+
+    return results

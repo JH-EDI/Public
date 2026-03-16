@@ -23,10 +23,14 @@ import pyodbc
 
 
 def _make_conn_str() -> str:
-    # mimic the logic used in sap_archive.hana
-    dsn = os.environ.get("SAPARCHIVE_HANA_DSN", "HANA")
-    uid = os.environ.get("SAPARCHIVE_HANA_UID", "")
-    pwd = os.environ.get("SAPARCHIVE_HANA_PWD", "")
+    # mimic the logic used in sap_archive.hana; prefer the same
+    # environment variables (`SAP_HANA_*`) but fall back to the older
+    # `SAPARCHIVE_HANA_*` names that this standalone script historically
+    # used.  This keeps behaviour consistent with the rest of the
+    # package.
+    dsn = os.environ.get("SAP_HANA_DSN") or os.environ.get("SAPARCHIVE_HANA_DSN", "HANA")
+    uid = os.environ.get("SAP_HANA_USER") or os.environ.get("SAPARCHIVE_HANA_UID", "")
+    pwd = os.environ.get("SAP_HANA_PASSWORD") or os.environ.get("SAPARCHIVE_HANA_PWD", "")
     return f"DSN={dsn};UID={uid};PWD={pwd}"
 
 

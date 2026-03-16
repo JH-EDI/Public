@@ -1,0 +1,12 @@
+{
+  "query": "adso_snapshot_rsbrequestmess",
+  "tables": [
+    "SAPBI.RSBREQUESTMESS",
+    "SAPBI.RSBREQUESTDELTA"
+  ],
+  "watermark_table": "SAPBI.RSBREQUESTDELTA",
+  "watermark_column": "REQUIDOUT",
+  "last_run_utc": "2026-03-16T21:23:53.372573Z",
+  "last_watermark": 468618,
+  "last_sequence": 4
+}
